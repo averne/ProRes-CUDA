@@ -1,0 +1,443 @@
+#include <bit>
+#include <numeric>
+
+#include <cuda_runtime.h>
+
+extern "C" {
+#include <libavutil/pixdesc.h>
+}
+
+#include "common.cuh"
+
+#include "decoder.hpp"
+
+struct KernelParams {
+    CUdeviceptr slice_data;
+    std::uint32_t bitstream_size;
+
+    std::uint16_t width;
+    std::uint16_t height;
+    std::uint16_t mb_width;
+    std::uint16_t mb_height;
+    std::uint16_t slice_width;
+    std::uint16_t slice_height;
+    std::uint8_t  log2_chroma_w;
+    std::uint8_t  depth;
+    std::uint8_t  alpha_info;
+    std::uint8_t  bottom_field;
+
+    std::uint8_t  qmat_luma  [8][8];
+    std::uint8_t  qmat_chroma[8][8];
+};
+
+struct SliceContext {
+    std::uint16_t mb_x;
+    std::uint16_t mb_y;
+    std::uint8_t  mb_count;
+};
+
+__constant__ KernelParams params_vld;
+
+template <bool interlaced> __device__
+static inline void put_px(cudaSurfaceObject_t dst, int2 pos, uint v) {
+    if constexpr (!interlaced)
+        surf2Dwrite<std::uint16_t>(v, dst, pos.x * sizeof(std::uint16_t), pos.y);
+    else
+        surf2Dwrite<std::uint16_t>(v, dst, pos.x * sizeof(std::uint16_t), (pos.y << 1) + params_vld.bottom_field);
+}
+
+/* 7.5.3 Pixel Arrangement */
+__device__
+int2 pos_to_block(uint pos, uint luma)
+{
+    return int2((pos & -luma - 2) + luma >> 1, pos >> luma & 1) << 3;
+}
+
+/* 7.1.1.2 Signed Golomb Combination Codes */
+__device__
+uint to_signed(uint x)
+{
+    return (x >> 1) ^ -(x & 1);
+}
+
+/* 7.1.1.1 Golomb Combination Codes */
+__device__
+uint decode_codeword(util::Bitstream &gb, std::uint16_t codebook)
+{
+    uint last_rice_q = (codebook >> 0) & 15,
+         krice       = (codebook >> 4) & 15,
+         kexp        = (codebook >> 8);
+
+    uint q = 31 - findMSB(gb.show_bits(32));
+    if (q <= last_rice_q) {
+        /* Golomb-Rice encoding */
+        return (gb.get_bits(krice + q + 1) & ~(1 << krice)) + (q << krice);
+    } else {
+        /* exp-Golomb encoding */
+        return gb.get_bits((q << 1) + kexp - last_rice_q) - (1 << kexp) + ((last_rice_q + 1) << krice);
+    }
+}
+
+template <bool interlaced> __device__
+void decode_comp(cudaSurfaceObject_t dst, util::Bitstream gb, SliceContext ctx, uint qscale)
+{
+    uint is_luma = uint(blockIdx.z == 0);
+    uint chroma_shift = bool(is_luma) ? 0 : params_vld.log2_chroma_w;
+
+    uint num_blocks = ctx.mb_count << (2 - chroma_shift);
+    int2 base_pos = int2(ctx.mb_x << (4 - chroma_shift), ctx.mb_y << 4);
+
+    /* 7.1.1.3 DC Coefficients */
+    {
+        /* First coeff */
+        uint c = to_signed(decode_codeword(gb, U16(0x650)));
+        put_px<interlaced>(dst, base_pos, c * qscale & 0xffff);
+
+        /**
+         * Table 9, encoded as (last_rice_q << 0) | (krice or kexp << 4) | ((kexp or kexp + 1) << 8)
+         * According to the SMPTE document, abs(prev_dc_diff) should be used
+         * to index the table, duplicating the entries removes the abs operation
+         */
+        const uint16_t dc_codebook[] = { U16(0x100),
+                                         U16(0x210), U16(0x210),
+                                         U16(0x321), U16(0x321),
+                                         U16(0x430), U16(0x430), };
+
+        uint cw = 5, prev_dc_diff = 0;
+        for (int i = 1; i < num_blocks; ++i) {
+            cw = decode_codeword(gb, dc_codebook[min(cw, 6)]);
+
+            int s = int(prev_dc_diff) >> 31;
+            c += prev_dc_diff = (to_signed(cw) ^ s) - s;
+
+            put_px<interlaced>(dst, base_pos + pos_to_block(i, is_luma), c * qscale & 0xffff);
+        }
+    }
+
+    /* 7.1.1.4 AC Coefficients */
+    {
+        /* Table 10 */
+        const uint16_t ac_run_codebook  [] = { U16(0x102), U16(0x102), U16(0x101), U16(0x101),
+                                               U16(0x100), U16(0x211), U16(0x211), U16(0x211),
+                                               U16(0x211), U16(0x210), U16(0x210), U16(0x210),
+                                               U16(0x210), U16(0x210), U16(0x210), U16(0x320), };
+
+        /* Table 11 */
+        const uint16_t ac_level_codebook[] = { U16(0x202), U16(0x101), U16(0x102), U16(0x100),
+                                               U16(0x210), U16(0x210), U16(0x210), U16(0x210),
+                                               U16(0x320) };
+
+        /* Figure 4, encoded as (x << 0) | (y << 4) */
+        const uint8_t scan_tbl_prog[] = {
+            U8(0x00), U8(0x01), U8(0x10), U8(0x11), U8(0x02), U8(0x03), U8(0x12), U8(0x13),
+            U8(0x20), U8(0x21), U8(0x30), U8(0x31), U8(0x22), U8(0x23), U8(0x32), U8(0x33),
+            U8(0x04), U8(0x05), U8(0x14), U8(0x24), U8(0x15), U8(0x06), U8(0x07), U8(0x16),
+            U8(0x25), U8(0x34), U8(0x35), U8(0x26), U8(0x17), U8(0x27), U8(0x36), U8(0x37),
+            U8(0x40), U8(0x41), U8(0x50), U8(0x60), U8(0x51), U8(0x42), U8(0x43), U8(0x52),
+            U8(0x61), U8(0x70), U8(0x71), U8(0x62), U8(0x53), U8(0x44), U8(0x45), U8(0x54),
+            U8(0x63), U8(0x72), U8(0x73), U8(0x64), U8(0x55), U8(0x46), U8(0x47), U8(0x56),
+            U8(0x65), U8(0x74), U8(0x75), U8(0x66), U8(0x57), U8(0x67), U8(0x76), U8(0x77),
+        };
+
+        /* Figure 5 */
+        const uint8_t scan_tbl_itld[] = {
+            U8(0x00), U8(0x10), U8(0x01), U8(0x11), U8(0x20), U8(0x30), U8(0x21), U8(0x31),
+            U8(0x02), U8(0x12), U8(0x03), U8(0x13), U8(0x22), U8(0x32), U8(0x23), U8(0x33),
+            U8(0x40), U8(0x50), U8(0x41), U8(0x42), U8(0x51), U8(0x60), U8(0x70), U8(0x61),
+            U8(0x52), U8(0x43), U8(0x53), U8(0x62), U8(0x71), U8(0x72), U8(0x63), U8(0x73),
+            U8(0x04), U8(0x14), U8(0x05), U8(0x06), U8(0x15), U8(0x24), U8(0x34), U8(0x25),
+            U8(0x16), U8(0x07), U8(0x17), U8(0x26), U8(0x35), U8(0x44), U8(0x54), U8(0x45),
+            U8(0x36), U8(0x27), U8(0x37), U8(0x46), U8(0x55), U8(0x64), U8(0x74), U8(0x65),
+            U8(0x56), U8(0x47), U8(0x57), U8(0x66), U8(0x75), U8(0x76), U8(0x67), U8(0x77),
+        };
+
+        auto scan_tbl = !interlaced ? scan_tbl_prog : scan_tbl_itld;
+        uint block_mask  = num_blocks - 1;
+        uint block_shift = findLSB(num_blocks);
+
+        uint pos = num_blocks - 1, run = 4, level = 1, s;
+        while (pos < (num_blocks << 6) - 1) {
+            uint left = gb.left_bits();
+            if (left <= 0 || (left < 32 && gb.show_bits(left) == 0))
+                break;
+
+            run   = decode_codeword(gb, ac_run_codebook  [min(run,   15)]);
+            level = decode_codeword(gb, ac_level_codebook[min(level, 8 )]);
+            s     = gb.get_bits(1);
+
+            pos += run + 1;
+
+            uint bidx = pos & block_mask, scan = scan_tbl[pos >> block_shift];
+            int2 spos = pos_to_block(bidx, is_luma);
+            int2 bpos = int2(scan & 0xf, scan >> 4);
+
+            uint c = ((level + 1) ^ -s) + s;
+            put_px<interlaced>(dst, base_pos + spos + bpos, c * qscale & 0xffff);
+        }
+    }
+}
+
+template <bool interlaced> __global__ __launch_bounds__(64)
+void color_vld(cudaSurfaceObject_t *dst, const std::uint32_t *slice_offsets, const SliceContext *slice_ctxs)
+{
+    auto gid = blockIdx * blockDim + threadIdx;
+    if (gid.x >= params_vld.slice_width || gid.y >= params_vld.slice_height)
+        return;
+
+    uint slice_idx = gid.y * params_vld.slice_width + gid.x;
+    uint slice_off  = slice_offsets[slice_idx],
+         slice_size = slice_offsets[slice_idx + 1] - slice_off;
+
+    auto *bs = reinterpret_cast<const std::uint8_t *>(params_vld.slice_data + slice_off);
+
+    /* Decode slice header */
+    uint hdr_size = 0, y_size = 0, u_size = 0, v_size = 0, qscale = 0;
+    hdr_size = bs[0] >> 3;
+
+    /* Table 15 */
+    uint qidx = clamp(bs[1], 1, 224);
+    qscale = qidx > 128 ? (qidx - 96) << 2 : qidx;
+
+    y_size = (uint(bs[2]) << 8) | bs[3];
+    u_size = (uint(bs[4]) << 8) | bs[5];
+
+    /**
+     * The alpha_info field can be 0 even when an alpha plane is present,
+     * if skip_alpha is enabled, so use the header size instead.
+     */
+    if (hdr_size > 6)
+        v_size = (uint(bs[6]) << 8) | bs[7];
+    else
+        v_size = slice_size - hdr_size - y_size - u_size;
+
+    util::Bitstream gb;
+    switch (gid.z) {
+        case 0:
+            gb.init(bs + hdr_size, y_size);
+            break;
+        case 1:
+            gb.init(bs + hdr_size + y_size, u_size);
+            break;
+        case 2:
+            gb.init(bs + hdr_size + y_size + u_size, v_size);
+            break;
+    }
+
+    /**
+     * Support for the grayscale "extension" in the prores_aw encoder.
+     * According to the spec, entropy coded data should never be empty,
+     * and instead contain at least the DC coefficients.
+     * This avoids undefined behavior.
+     */
+    if (gb.left_bits() == 0)
+        return;
+
+    /* Entropy decoding, inverse scanning, first part of inverse quantization */
+    decode_comp<interlaced>(dst[gid.z], gb, slice_ctxs[slice_idx], qscale);
+}
+
+int CudaProresDecoder::parse_frame_header(ProresFrame &frame, util::Bytestream &bs) {
+    // 5.1.1 Frame Header Syntax
+    auto hdr_size = bs.get_be<std::uint16_t>();
+    if (bs.left() < static_cast<std::size_t>(hdr_size))
+        return -1;
+
+    // reserved, bitstream_version, encoder_identifier
+    bs.skip(6);
+
+    frame.width = bs.get_be<std::uint16_t>(), frame.height = bs.get_be<std::uint16_t>();
+
+    auto flags = bs.get_be<std::uint8_t>();
+    frame.chroma_fmt     = static_cast<ProresChromaFormat >(flags >> 6 & util::mask(2));
+    frame.interlace_mode = static_cast<ProresInterlaceMode>(flags >> 2 & util::mask(2));
+
+    // aspect_ratio_information, frame_rate_code, color_primaries, transfer_characteristic, matrix_coefficients
+    bs.skip(4);
+
+    frame.alpha_type = static_cast<ProresAlphaType>(bs.get_be<std::uint8_t>() & util::mask(4));
+
+    auto qmat_flags = bs.get_be<std::uint16_t>();
+
+    if (qmat_flags >> 0 & util::mask(1))
+        bs.read_into(frame.luma_qmat.data(), frame.luma_qmat.size());
+    else
+        std::fill_n(frame.luma_qmat.data(), frame.luma_qmat.size(), 4);
+
+    if (qmat_flags >> 1 & util::mask(1))
+        bs.read_into(frame.chroma_qmat.data(), frame.chroma_qmat.size());
+    else
+        std::copy_n(frame.luma_qmat.data(), frame.luma_qmat.size(), frame.chroma_qmat.data());
+
+    frame.bottom_field = frame.first_field ^ (frame.interlace_mode == ProresInterlaceMode::InterlacedTff);
+
+    switch (frame.interlace_mode) {
+        case ProresInterlaceMode::Progressive:
+            frame.pic_width  = frame.width;
+            frame.pic_height = frame.height;
+            break;
+        case ProresInterlaceMode::InterlacedTff:
+        case ProresInterlaceMode::InterlacedBff:
+            frame.pic_width  = frame.width;
+            frame.pic_height = (frame.height + !frame.bottom_field) / 2;
+            break;
+    }
+
+    frame.mb_width  = util::align_up(frame.pic_width,  ProresMbSize) / ProresMbSize;
+    frame.mb_height = util::align_up(frame.pic_height, ProresMbSize) / ProresMbSize;
+
+    return 0;
+}
+
+int CudaProresDecoder::parse_picture_header(ProresFrame &frame, util::Bytestream &bs) {
+    // 5.2.1 Picture Header Syntax
+    auto hdr_size = bs.get_be<std::uint8_t>() >> 3;
+    if (bs.left() < static_cast<std::size_t>(hdr_size))
+        return -1;
+
+    frame.picture_size = bs.get_be<std::uint32_t>();
+
+    // deprecated_number_of_slices
+    bs.skip(2);
+
+    frame.log2_slice_mb_width = bs.get_be<std::uint8_t>() >> 4;
+
+    frame.slice_width = (frame.mb_width >> frame.log2_slice_mb_width) +
+                        std::popcount(static_cast<std::uint16_t>(frame.mb_width & util::mask(frame.log2_slice_mb_width)));
+
+    frame.slice_sizes.resize(frame.slice_width * frame.mb_height);
+    std::generate_n(frame.slice_sizes.data(), frame.slice_sizes.size(), [&bs] { return bs.get_be<std::uint16_t>(); });
+
+    return 0;
+}
+
+int CudaProresDecoder::decode(ProresFrame frame, AVFrame *dst) {
+    auto bs = util::Bytestream(frame.buf->data, frame.buf->size);
+
+    // 5.1 Frame Syntax
+    auto frame_size = bs.get_be<std::uint32_t>(), frame_id = bs.get<std::uint32_t>();
+    if (static_cast<std::size_t>(frame.buf->size) < frame_size || frame_id != util::FourCC('i','c','p','f'))
+        return -1;
+
+    frame.first_field = true;
+    if (auto rc = this->parse_frame_header(frame, bs); rc < 0)
+        return rc;
+
+    if (auto rc = this->parse_picture_header(frame, bs); rc < 0)
+        return rc;
+
+    std::vector<std::uint32_t> slice_offsets_cpu(frame.slice_sizes.size() + 1, 0);
+    std::inclusive_scan(frame.slice_sizes.begin(), frame.slice_sizes.end(), slice_offsets_cpu.begin() + 1,
+                        std::plus(), std::uint32_t()); // Explicitly use 32-bit accumulator to avoid overflow
+
+    int mb_x = 0, slice_mb_width = 1 << frame.log2_slice_mb_width;
+    std::vector<SliceContext> slice_ctxs_cpu(frame.slice_sizes.size());
+    for (std::size_t i = 0; i < frame.slice_sizes.size(); ++i) {
+        auto &slice_ctx = slice_ctxs_cpu[i];
+
+        while (frame.mb_width - mb_x < slice_mb_width)
+            slice_mb_width >>= 1;
+
+        slice_ctx.mb_x = mb_x;
+        slice_ctx.mb_y = static_cast<std::uint16_t>(i / frame.slice_width);
+        slice_ctx.mb_count = slice_mb_width;
+
+        mb_x += slice_mb_width;
+
+        if (mb_x == frame.mb_width)
+            mb_x = 0, slice_mb_width = 1 << frame.log2_slice_mb_width;
+    }
+
+    AVPixelFormat pixfmt;
+    switch ((this->depth << 8) | static_cast<int>(frame.chroma_fmt)) {
+        case (10 << 8) | static_cast<int>(ProresChromaFormat::C422):
+            pixfmt = AV_PIX_FMT_YUV422P10;
+            break;
+        case (10 << 8) | static_cast<int>(ProresChromaFormat::C444):
+            pixfmt = AV_PIX_FMT_YUV444P10;
+            break;
+        case (12 << 8) | static_cast<int>(ProresChromaFormat::C422):
+            pixfmt = AV_PIX_FMT_YUV422P12;
+            break;
+        case (12 << 8) | static_cast<int>(ProresChromaFormat::C444):
+            pixfmt = AV_PIX_FMT_YUV444P12;
+            break;
+        default:
+            return -1;
+    }
+
+    std::array<cudaArray_t,         3> arrays   = {};
+    std::array<cudaSurfaceObject_t, 3> surfobjs = {};
+    SCOPEGUARD([&arrays]   { for (std::size_t i = 0; i < arrays  .size(); ++i) cudaFreeArray           (arrays  [i]); });
+    SCOPEGUARD([&surfobjs] { for (std::size_t i = 0; i < surfobjs.size(); ++i) cudaDestroySurfaceObject(surfobjs[i]); });
+
+    auto *pixdesc = av_pix_fmt_desc_get(pixfmt);
+    auto desc = cudaCreateChannelDesc(16, 0, 0, 0, cudaChannelFormatKindUnsigned);
+    for (std::size_t i = 0; i < surfobjs.size(); ++i) {
+        auto w = util::align_up(frame.pic_width,  ProresMbSize) * (int(frame.interlace_mode != ProresInterlaceMode::Progressive) + 1),
+             h = util::align_up(frame.pic_height, ProresMbSize) * (int(frame.interlace_mode != ProresInterlaceMode::Progressive) + 1);
+        CUDA_CHECK(cudaMallocArray(&arrays[i], &desc,
+                                   w >> (i ? pixdesc->log2_chroma_w : 0),
+                                   h >> (i ? pixdesc->log2_chroma_h : 0),
+                                   cudaArraySurfaceLoadStore));
+
+        auto desc = cudaResourceDesc{
+            .resType = cudaResourceTypeArray,
+            .res = { .array = { .array = arrays[i], }, },
+        };
+        CUDA_CHECK(cudaCreateSurfaceObject(&surfobjs[i], &desc));
+    }
+
+    void *surfaces, *slice_offsets, *slice_ctxs, *slice_data;
+    CUDA_CHECK(cudaMalloc(&surfaces,      surfobjs         .size() * sizeof(cudaSurfaceObject_t)));
+    CUDA_CHECK(cudaMalloc(&slice_offsets, slice_offsets_cpu.size() * sizeof(std::uint32_t      )));
+    CUDA_CHECK(cudaMalloc(&slice_ctxs,    slice_ctxs_cpu   .size() * sizeof(SliceContext       )));
+    CUDA_CHECK(cudaMalloc(&slice_data,    frame.buf->size));
+    SCOPEGUARD([&surfaces     ] { cudaFree(surfaces     ); });
+    SCOPEGUARD([&slice_offsets] { cudaFree(slice_offsets); });
+    SCOPEGUARD([&slice_ctxs   ] { cudaFree(slice_ctxs   ); });
+    SCOPEGUARD([&slice_data   ] { cudaFree(slice_data   ); });
+
+    auto p = KernelParams{
+        .slice_data      = reinterpret_cast<CUdeviceptr>(slice_data) + bs.tell(),
+        .bitstream_size  = static_cast<std::uint32_t>(frame.buf->size - bs.tell()),
+        .width           = frame.pic_width,
+        .height          = frame.pic_height,
+        .mb_width        = frame.mb_width,
+        .mb_height       = frame.mb_height,
+        .slice_width     = frame.slice_width,
+        .slice_height    = frame.mb_height,
+        .log2_chroma_w   = static_cast<std::uint8_t>(frame.chroma_fmt == ProresChromaFormat::C422 ? 1 : 0),
+        .depth           = static_cast<std::uint8_t>(this->depth),
+        .alpha_info      = static_cast<std::uint8_t>(frame.alpha_type),
+        .bottom_field    = static_cast<std::uint8_t>(frame.bottom_field)
+    };
+
+    CUDA_CHECK(cudaMemcpy(surfaces,      surfobjs         .data(), surfobjs         .size() * sizeof(cudaSurfaceObject_t), cudaMemcpyDefault));
+    CUDA_CHECK(cudaMemcpy(slice_offsets, slice_offsets_cpu.data(), slice_offsets_cpu.size() * sizeof(std::uint32_t      ), cudaMemcpyDefault));
+    CUDA_CHECK(cudaMemcpy(slice_ctxs,    slice_ctxs_cpu   .data(), slice_ctxs_cpu   .size() * sizeof(SliceContext       ), cudaMemcpyDefault));
+    CUDA_CHECK(cudaMemcpy(slice_data,    frame.buf->data,  frame.buf->size,                                                cudaMemcpyDefault));
+    CUDA_CHECK(cudaMemcpyToSymbol(params_vld, &p, sizeof(p)));
+
+    auto grid_size  = dim3(util::ceil_rshift(frame.slice_width, 3), util::ceil_rshift(frame.mb_height, 3), 3),
+         block_size = dim3(8, 8, 1);
+    if (frame.interlace_mode == ProresInterlaceMode::Progressive) {
+        color_vld<false><<<grid_size, block_size>>>(
+            static_cast<cudaSurfaceObject_t *>(surfaces), static_cast<std::uint32_t *>(slice_offsets), static_cast<SliceContext *>(slice_ctxs)
+        );
+    } else {
+        color_vld<true><<<grid_size, block_size>>>(
+            static_cast<cudaSurfaceObject_t *>(surfaces), static_cast<std::uint32_t *>(slice_offsets), static_cast<SliceContext *>(slice_ctxs)
+        );
+    }
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    for (std::size_t i = 0; i < arrays.size() && dst->data[i]; ++i) {
+        CUDA_CHECK(cudaMemcpy2DFromArray(dst->data[i], dst->linesize[i], arrays[i], 0, 0,
+                                         frame.width * sizeof(std::uint16_t) >> (i ? pixdesc->log2_chroma_w : 0),
+                                         frame.height                        >> (i ? pixdesc->log2_chroma_h : 0),
+                                         cudaMemcpyDefault));
+    }
+
+    return 0;
+}
