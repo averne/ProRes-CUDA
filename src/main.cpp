@@ -44,10 +44,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    auto pixfmt = static_cast<AVPixelFormat>(stream->codecpar->format);
+
     std::printf("Video stream: idx %d, %s profile, %dx%d %s\n", stream_idx,
         avcodec_profile_name(stream->codecpar->codec_id, stream->codecpar->profile),
-        stream->codecpar->width, stream->codecpar->height,
-        av_get_pix_fmt_name(static_cast<AVPixelFormat>(stream->codecpar->format)));
+        stream->codecpar->width, stream->codecpar->height, av_get_pix_fmt_name(pixfmt));
 
     AVPacket *pkt = av_packet_alloc();
     SCOPEGUARD([&pkt] { av_packet_free(&pkt); });
@@ -56,15 +57,13 @@ int main(int argc, char **argv) {
     SCOPEGUARD([&fr] { av_frame_free(&fr); });
     fr->width = stream->codecpar->width, fr->height = stream->codecpar->height;
 
-    auto sz = av_image_get_buffer_size(static_cast<AVPixelFormat>(stream->codecpar->format),
-                                       stream->codecpar->width, stream->codecpar->height, 1);
+    auto sz = av_image_get_buffer_size(pixfmt, stream->codecpar->width, stream->codecpar->height, 1);
 
     auto *dat = av_malloc(sz);
     SCOPEGUARD([&dat] { av_free(dat); });
 
     LAV_CHECK(av_image_fill_arrays(fr->data, fr->linesize, static_cast<std::uint8_t *>(dat),
-                                   static_cast<AVPixelFormat>(stream->codecpar->format),
-                                   stream->codecpar->width, stream->codecpar->height, 1));
+                                   pixfmt, stream->codecpar->width, stream->codecpar->height, 1));
 
     auto decoder = CudaProresDecoder(stream->codecpar->bits_per_raw_sample);
     while (av_read_frame(fmt_ctx, pkt) >= 0) {
@@ -80,9 +79,10 @@ int main(int argc, char **argv) {
         auto *fp = std::fopen("out.yuv", "wb");
         SCOPEGUARD([&fp] { std::fclose(fp); });
 
-        std::fwrite(fr->data[0], fr->linesize[0], fr->height, fp);
-        std::fwrite(fr->data[1], fr->linesize[1], fr->height, fp);
-        std::fwrite(fr->data[2], fr->linesize[2], fr->height, fp);
+        for (int i = 0; i < 4; ++i) {
+            if (fr->data[i])
+                std::fwrite(fr->data[i], fr->linesize[i], fr->height, fp);
+        }
 
         break;
     }

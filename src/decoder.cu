@@ -244,6 +244,94 @@ void kern_color_vld(cudaSurfaceObject_t *dst, const std::uint32_t *slice_offsets
     decode_comp<interlaced>(dst[gid.z], gb, slice_ctxs[slice_idx], qscale);
 }
 
+/* 7.1.2 Scanned Alpha */
+template <bool interlaced> __device__
+void decode_alpha(cudaSurfaceObject_t dst, util::Bitstream gb, SliceContext ctx) {
+    auto gid = blockIdx * blockDim + threadIdx;
+
+    int2 base_pos = int2(ctx.mb_x, ctx.mb_y) << 4;
+    uint block_shift = findMSB(ctx.mb_count) + 4, block_mask = (1 << block_shift) - 1;
+
+    uint mask = (1 << (4 << params.alpha_info)) - 1;
+    uint num_values = (ctx.mb_count << 4) * min(params.height - (gid.y << 4), 16);
+
+    uint num_cw_bits  = params.alpha_info == 1 ? 5 : 8,
+         num_flc_bits = params.alpha_info == 1 ? 9 : 17;
+
+    uint alpha_rescale_lshift = params.alpha_info == 1 ? params.depth - 8 : 16,
+         alpha_rescale_rshift = 16 - params.depth;
+
+    uint alpha = -1u;
+    for (uint pos = 0; pos < num_values;) {
+        uint diff, run;
+
+        /* Decode run value */
+        {
+            uint bits = gb.show_bits(num_cw_bits), q = num_cw_bits - 1 - findMSB(bits);
+
+            /* Tables 13/14 */
+            if (q != 0) {
+                uint m = (bits >> 1) + 1, s = bits & 1;
+                diff = (m ^ -s) + s;
+                gb.skip_bits(num_cw_bits);
+            } else {
+                diff = gb.get_bits(num_flc_bits);
+            }
+
+            alpha = alpha + diff & mask;
+        }
+
+        /* Decode run length */
+        {
+            uint bits = gb.show_bits(5), q = 4 - findMSB(bits);
+
+            /* Table 12 */
+            if (q == 0) {
+                run = 1;
+                gb.skip_bits(1);
+            } else if (q <= 4) {
+                run = bits + 1;
+                gb.skip_bits(5);
+            } else {
+                run = gb.get_bits(16) + 1;
+            }
+
+            run = min(run, num_values - pos);
+        }
+
+        /**
+         * FFmpeg doesn't support color and alpha with different precision,
+         * so we need to rescale to the color range.
+         */
+        uint val = (alpha << alpha_rescale_lshift) | (alpha >> alpha_rescale_rshift);
+        for (uint end = pos + run; pos < end; ++pos)
+            put_px<interlaced>(dst, base_pos + int2(pos & block_mask, pos >> block_shift), val & 0xffff);
+    }
+}
+
+template <bool interlaced> __global__ __launch_bounds__(64)
+void kern_alpha_vld(cudaSurfaceObject_t *dst, const std::uint32_t *slice_offsets, const SliceContext *slice_ctxs) {
+    auto gid = blockIdx * blockDim + threadIdx;
+    if (gid.x >= params.slice_width || gid.y >= params.slice_height)
+        return;
+
+    uint slice_idx = gid.y * params.slice_width + gid.x;
+    uint slice_off  = slice_offsets[slice_idx],
+         slice_size = slice_offsets[slice_idx + 1] - slice_off;
+
+    /* Decode slice header */
+    auto *bs = reinterpret_cast<const std::uint8_t *>(params.slice_data + slice_off);
+    uint skip_size = (bs[0] >> 3) +
+        ((uint(bs[2]) << 8) | bs[3]) +
+        ((uint(bs[4]) << 8) | bs[5]) +
+        ((uint(bs[6]) << 8) | bs[7]);
+
+    util::Bitstream gb;
+    gb.init(bs + skip_size, slice_size - skip_size);
+
+    decode_alpha<interlaced>(dst[3], gb, slice_ctxs[slice_idx]);
+}
+
 // https://github.com/NVIDIA/cuda-samples/blob/master/Samples/2_Concepts_and_Techniques/dct8x8/dct8x8_kernel2.cuh
 #define C_a 1.387039845322148f     //!< a = (2^0.5) * cos(    pi / 16);
 #define C_b 1.306562964876377f     //!< b = (2^0.5) * cos(    pi /  8);
@@ -443,36 +531,54 @@ int CudaProresDecoder::decode(ProresFrame frame, AVFrame *dst) {
     }
 
     AVPixelFormat pixfmt;
-    switch ((this->depth << 8) | static_cast<int>(frame.chroma_fmt)) {
-        case (10 << 8) | static_cast<int>(ProresChromaFormat::C422):
+    switch ((this->depth << 16) | (static_cast<int>(frame.alpha_type) << 8) | (static_cast<int>(frame.chroma_fmt) << 0)) {
+        case (10 << 16) | (static_cast<int>(ProresAlphaType::None) << 8) | (static_cast<int>(ProresChromaFormat::C422) << 0):
             pixfmt = AV_PIX_FMT_YUV422P10;
             break;
-        case (10 << 8) | static_cast<int>(ProresChromaFormat::C444):
+        case (10 << 16) | (static_cast<int>(ProresAlphaType::None) << 8) | (static_cast<int>(ProresChromaFormat::C444) << 0):
             pixfmt = AV_PIX_FMT_YUV444P10;
             break;
-        case (12 << 8) | static_cast<int>(ProresChromaFormat::C422):
+        case (10 << 16) | (static_cast<int>(ProresAlphaType::B8  ) << 8) | (static_cast<int>(ProresChromaFormat::C422) << 0):
+        case (10 << 16) | (static_cast<int>(ProresAlphaType::B16 ) << 8) | (static_cast<int>(ProresChromaFormat::C422) << 0):
+            pixfmt = AV_PIX_FMT_YUVA422P10;
+            break;
+        case (10 << 16) | (static_cast<int>(ProresAlphaType::B8  ) << 8) | (static_cast<int>(ProresChromaFormat::C444) << 0):
+        case (10 << 16) | (static_cast<int>(ProresAlphaType::B16 ) << 8) | (static_cast<int>(ProresChromaFormat::C444) << 0):
+            pixfmt = AV_PIX_FMT_YUVA444P10;
+            break;
+        case (12 << 16) | (static_cast<int>(ProresAlphaType::None) << 8) | (static_cast<int>(ProresChromaFormat::C422) << 0):
             pixfmt = AV_PIX_FMT_YUV422P12;
             break;
-        case (12 << 8) | static_cast<int>(ProresChromaFormat::C444):
+        case (12 << 16) | (static_cast<int>(ProresAlphaType::None) << 8) | (static_cast<int>(ProresChromaFormat::C444) << 0):
             pixfmt = AV_PIX_FMT_YUV444P12;
+            break;
+        case (12 << 16) | (static_cast<int>(ProresAlphaType::B8  ) << 8) | (static_cast<int>(ProresChromaFormat::C422) << 0):
+        case (12 << 16) | (static_cast<int>(ProresAlphaType::B16 ) << 8) | (static_cast<int>(ProresChromaFormat::C422) << 0):
+            pixfmt = AV_PIX_FMT_YUVA422P12;
+            break;
+        case (12 << 16) | (static_cast<int>(ProresAlphaType::B8  ) << 8) | (static_cast<int>(ProresChromaFormat::C444) << 0):
+        case (12 << 16) | (static_cast<int>(ProresAlphaType::B16 ) << 8) | (static_cast<int>(ProresChromaFormat::C444) << 0):
+            pixfmt = AV_PIX_FMT_YUVA444P12;
             break;
         default:
             return -1;
     }
 
-    std::array<cudaArray_t,         3> arrays   = {};
-    std::array<cudaSurfaceObject_t, 3> surfobjs = {};
-    SCOPEGUARD([&arrays]   { for (std::size_t i = 0; i < arrays  .size(); ++i) cudaFreeArray           (arrays  [i]); });
-    SCOPEGUARD([&surfobjs] { for (std::size_t i = 0; i < surfobjs.size(); ++i) cudaDestroySurfaceObject(surfobjs[i]); });
-
     auto *pixdesc = av_pix_fmt_desc_get(pixfmt);
+
+    std::array<cudaArray_t,         4> arrays   = {};
+    std::array<cudaSurfaceObject_t, 4> surfobjs = {};
+    SCOPEGUARD([&] { for (std::size_t i = 0; i < pixdesc->nb_components; ++i) cudaFreeArray           (arrays  [i]); });
+    SCOPEGUARD([&] { for (std::size_t i = 0; i < pixdesc->nb_components; ++i) cudaDestroySurfaceObject(surfobjs[i]); });
+
     auto desc = cudaCreateChannelDesc(16, 0, 0, 0, cudaChannelFormatKindUnsigned);
-    for (std::size_t i = 0; i < surfobjs.size(); ++i) {
+    for (std::size_t i = 0; i < pixdesc->nb_components; ++i) {
+        bool chroma = std::clamp<std::size_t>(i, 1, 2) == i;
         auto w = util::align_up(frame.pic_width,  ProresMbSize) * (int(frame.interlace_mode != ProresInterlaceMode::Progressive) + 1),
              h = util::align_up(frame.pic_height, ProresMbSize) * (int(frame.interlace_mode != ProresInterlaceMode::Progressive) + 1);
         CUDA_CHECK(cudaMallocArray(&arrays[i], &desc,
-                                   w >> (i ? pixdesc->log2_chroma_w : 0),
-                                   h >> (i ? pixdesc->log2_chroma_h : 0),
+                                   w >> (chroma ? pixdesc->log2_chroma_w : 0),
+                                   h >> (chroma ? pixdesc->log2_chroma_h : 0),
                                    cudaArraySurfaceLoadStore));
 
         auto desc = cudaResourceDesc{
@@ -483,7 +589,7 @@ int CudaProresDecoder::decode(ProresFrame frame, AVFrame *dst) {
     }
 
     void *surfaces, *slice_offsets, *slice_ctxs, *slice_data;
-    CUDA_CHECK(cudaMalloc(&surfaces,      surfobjs         .size() * sizeof(cudaSurfaceObject_t)));
+    CUDA_CHECK(cudaMalloc(&surfaces,      pixdesc->nb_components   * sizeof(cudaSurfaceObject_t)));
     CUDA_CHECK(cudaMalloc(&slice_offsets, slice_offsets_cpu.size() * sizeof(std::uint32_t      )));
     CUDA_CHECK(cudaMalloc(&slice_ctxs,    slice_ctxs_cpu   .size() * sizeof(SliceContext       )));
     CUDA_CHECK(cudaMalloc(&slice_data,    frame.buf->size));
@@ -510,7 +616,7 @@ int CudaProresDecoder::decode(ProresFrame frame, AVFrame *dst) {
     std::copy_n(frame.luma_qmat  [0], sizeof(frame.luma_qmat  ) * sizeof(std::uint8_t), p.qmat_luma  [0]);
     std::copy_n(frame.chroma_qmat[0], sizeof(frame.chroma_qmat) * sizeof(std::uint8_t), p.qmat_chroma[0]);
 
-    CUDA_CHECK(cudaMemcpy(surfaces,      surfobjs         .data(), surfobjs         .size() * sizeof(cudaSurfaceObject_t), cudaMemcpyDefault));
+    CUDA_CHECK(cudaMemcpy(surfaces,      surfobjs         .data(), pixdesc->nb_components   * sizeof(cudaSurfaceObject_t), cudaMemcpyDefault));
     CUDA_CHECK(cudaMemcpy(slice_offsets, slice_offsets_cpu.data(), slice_offsets_cpu.size() * sizeof(std::uint32_t      ), cudaMemcpyDefault));
     CUDA_CHECK(cudaMemcpy(slice_ctxs,    slice_ctxs_cpu   .data(), slice_ctxs_cpu   .size() * sizeof(SliceContext       ), cudaMemcpyDefault));
     CUDA_CHECK(cudaMemcpy(slice_data,    frame.buf->data,  frame.buf->size,                                                cudaMemcpyDefault));
@@ -527,6 +633,10 @@ int CudaProresDecoder::decode(ProresFrame frame, AVFrame *dst) {
         kern_idct<false><<<idct_grid_size, idct_block_size>>>(
             static_cast<cudaSurfaceObject_t *>(surfaces)
         );
+        if (frame.alpha_type != ProresAlphaType::None)
+            kern_alpha_vld<false><<<vld_grid_size, vld_block_size>>>(
+                static_cast<cudaSurfaceObject_t *>(surfaces), static_cast<std::uint32_t *>(slice_offsets), static_cast<SliceContext *>(slice_ctxs)
+            );
     } else {
         kern_color_vld<true><<<vld_grid_size, vld_block_size>>>(
             static_cast<cudaSurfaceObject_t *>(surfaces), static_cast<std::uint32_t *>(slice_offsets), static_cast<SliceContext *>(slice_ctxs)
@@ -534,14 +644,19 @@ int CudaProresDecoder::decode(ProresFrame frame, AVFrame *dst) {
         kern_idct<true><<<idct_grid_size, idct_block_size>>>(
             static_cast<cudaSurfaceObject_t *>(surfaces)
         );
+        if (frame.alpha_type != ProresAlphaType::None)
+            kern_alpha_vld<true><<<vld_grid_size, vld_block_size>>>(
+                static_cast<cudaSurfaceObject_t *>(surfaces), static_cast<std::uint32_t *>(slice_offsets), static_cast<SliceContext *>(slice_ctxs)
+            );
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    for (std::size_t i = 0; i < arrays.size() && dst->data[i]; ++i) {
+    for (std::size_t i = 0; i < pixdesc->nb_components && dst->data[i]; ++i) {
+        bool chroma = std::clamp<std::size_t>(i, 1, 2) == i;
         CUDA_CHECK(cudaMemcpy2DFromArray(dst->data[i], dst->linesize[i], arrays[i], 0, 0,
-                                         frame.width * sizeof(std::uint16_t) >> (i ? pixdesc->log2_chroma_w : 0),
-                                         frame.height                        >> (i ? pixdesc->log2_chroma_h : 0),
+                                         frame.width * sizeof(std::uint16_t) >> (chroma ? pixdesc->log2_chroma_w : 0),
+                                         frame.height                        >> (chroma ? pixdesc->log2_chroma_h : 0),
                                          cudaMemcpyDefault));
     }
 
