@@ -37,7 +37,7 @@ enum class ProresAlphaType {
     B16  = 2,
 };
 
-using ProresQuantizationMatrix = std::array<std::uint8_t, 8*8>;
+using ProresQuantizationMatrix = std::uint8_t[8][8];
 
 struct ProresFrame {
     ProresFrame(AVBufferRef *buf): buf(av_buffer_ref(buf)) { }

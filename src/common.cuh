@@ -8,21 +8,34 @@
 #define U8(x)  uint8_t (x)
 #define U16(x) uint16_t(x)
 
-__device__
-static inline uint findLSB(uint v) {
+__device__ __forceinline__
+static uint findLSB(uint v) {
     return __ffs(v) - 1;
 }
 
-__device__
-static inline uint findMSB(uint v) {
+__device__ __forceinline__
+static uint findMSB(uint v) {
     return 31 - __clz(v);
 }
 
-template <typename T> __device__
-T clamp(T v, auto lo, auto hi) {
+template <typename T> __device__ __forceinline__
+static T clamp(T v, auto lo, auto hi) {
     return min(max(v, lo), hi);
 }
 
+// CUDA doesn't have a bitfield extract intrinsic for some reason
+template <typename T> __device__ __forceinline__
+static T sign_extend(T v, int bits) {
+    if constexpr (sizeof(T) == sizeof(std::uint64_t)) {
+        std::int64_t tmp = v;
+        asm volatile("bfe.s64 %0, %1, 0, %2;" : "=l"(tmp) : "l"(tmp), "r"(bits));
+        return static_cast<T>(tmp);
+    } else {
+        std::int32_t tmp = v;
+        asm volatile("bfe.s32 %0, %1, 0, %2;" : "=r"(tmp) : "r"(tmp), "r"(bits));
+        return static_cast<T>(tmp);
+    }
+}
 
 #define DEFINE_VEC1_UNARY_OP_RET(type, op)                                          \
     __host__ __device__ __forceinline__                                             \

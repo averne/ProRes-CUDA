@@ -36,14 +36,22 @@ struct SliceContext {
     std::uint8_t  mb_count;
 };
 
-__constant__ KernelParams params_vld;
+__constant__ KernelParams params;
+
+template <bool interlaced> __device__
+static inline uint get_px(cudaSurfaceObject_t src, int2 pos) {
+    if constexpr (!interlaced)
+        return surf2Dread<std::uint16_t>(src, pos.x * sizeof(std::uint16_t), pos.y);
+    else
+        return surf2Dread<std::uint16_t>(src, pos.x * sizeof(std::uint16_t), (pos.y << 1) + params.bottom_field);
+}
 
 template <bool interlaced> __device__
 static inline void put_px(cudaSurfaceObject_t dst, int2 pos, uint v) {
     if constexpr (!interlaced)
         surf2Dwrite<std::uint16_t>(v, dst, pos.x * sizeof(std::uint16_t), pos.y);
     else
-        surf2Dwrite<std::uint16_t>(v, dst, pos.x * sizeof(std::uint16_t), (pos.y << 1) + params_vld.bottom_field);
+        surf2Dwrite<std::uint16_t>(v, dst, pos.x * sizeof(std::uint16_t), (pos.y << 1) + params.bottom_field);
 }
 
 /* 7.5.3 Pixel Arrangement */
@@ -82,7 +90,7 @@ template <bool interlaced> __device__
 void decode_comp(cudaSurfaceObject_t dst, util::Bitstream gb, SliceContext ctx, uint qscale)
 {
     uint is_luma = uint(blockIdx.z == 0);
-    uint chroma_shift = bool(is_luma) ? 0 : params_vld.log2_chroma_w;
+    uint chroma_shift = bool(is_luma) ? 0 : params.log2_chroma_w;
 
     uint num_blocks = ctx.mb_count << (2 - chroma_shift);
     int2 base_pos = int2(ctx.mb_x << (4 - chroma_shift), ctx.mb_y << 4);
@@ -178,17 +186,17 @@ void decode_comp(cudaSurfaceObject_t dst, util::Bitstream gb, SliceContext ctx, 
 }
 
 template <bool interlaced> __global__ __launch_bounds__(64)
-void color_vld(cudaSurfaceObject_t *dst, const std::uint32_t *slice_offsets, const SliceContext *slice_ctxs)
+void kern_color_vld(cudaSurfaceObject_t *dst, const std::uint32_t *slice_offsets, const SliceContext *slice_ctxs)
 {
     auto gid = blockIdx * blockDim + threadIdx;
-    if (gid.x >= params_vld.slice_width || gid.y >= params_vld.slice_height)
+    if (gid.x >= params.slice_width || gid.y >= params.slice_height)
         return;
 
-    uint slice_idx = gid.y * params_vld.slice_width + gid.x;
+    uint slice_idx = gid.y * params.slice_width + gid.x;
     uint slice_off  = slice_offsets[slice_idx],
          slice_size = slice_offsets[slice_idx + 1] - slice_off;
 
-    auto *bs = reinterpret_cast<const std::uint8_t *>(params_vld.slice_data + slice_off);
+    auto *bs = reinterpret_cast<const std::uint8_t *>(params.slice_data + slice_off);
 
     /* Decode slice header */
     uint hdr_size = 0, y_size = 0, u_size = 0, v_size = 0, qscale = 0;
@@ -236,6 +244,93 @@ void color_vld(cudaSurfaceObject_t *dst, const std::uint32_t *slice_offsets, con
     decode_comp<interlaced>(dst[gid.z], gb, slice_ctxs[slice_idx], qscale);
 }
 
+// https://github.com/NVIDIA/cuda-samples/blob/master/Samples/2_Concepts_and_Techniques/dct8x8/dct8x8_kernel2.cuh
+#define C_a 1.387039845322148f     //!< a = (2^0.5) * cos(    pi / 16);
+#define C_b 1.306562964876377f     //!< b = (2^0.5) * cos(    pi /  8);
+#define C_c 1.175875602419359f     //!< c = (2^0.5) * cos(3 * pi / 16);
+#define C_d 0.785694958387102f     //!< d = (2^0.5) * cos(5 * pi / 16);
+#define C_e 0.541196100146197f     //!< e = (2^0.5) * cos(3 * pi /  8);
+#define C_f 0.275899379282943f     //!< f = (2^0.5) * cos(7 * pi / 16);
+#define C_norm 0.3535533905932737f //!< 1 / (8^0.5)
+
+/* 7.4 Inverse Transform */
+__device__
+void idct(float blocks[8][72], uint block, uint offset, uint stride) {
+    float Vect0 = blocks[block][0*stride + offset];
+    float Vect1 = blocks[block][1*stride + offset];
+    float Vect2 = blocks[block][2*stride + offset];
+    float Vect3 = blocks[block][3*stride + offset];
+    float Vect4 = blocks[block][4*stride + offset];
+    float Vect5 = blocks[block][5*stride + offset];
+    float Vect6 = blocks[block][6*stride + offset];
+    float Vect7 = blocks[block][7*stride + offset];
+
+    float Y04P   = Vect0 + Vect4;
+    float Y2b6eP = C_b * Vect2 + C_e * Vect6;
+
+    float Y04P2b6ePP   = Y04P + Y2b6eP;
+    float Y04P2b6ePM   = Y04P - Y2b6eP;
+    float Y7f1aP3c5dPP = C_f * Vect7 + C_a * Vect1 + C_c * Vect3 + C_d * Vect5;
+    float Y7a1fM3d5cMP = C_a * Vect7 - C_f * Vect1 + C_d * Vect3 - C_c * Vect5;
+
+    float Y04M   = Vect0 - Vect4;
+    float Y2e6bM = C_e * Vect2 - C_b * Vect6;
+
+    float Y04M2e6bMP   = Y04M + Y2e6bM;
+    float Y04M2e6bMM   = Y04M - Y2e6bM;
+    float Y1c7dM3f5aPM = C_c * Vect1 - C_d * Vect7 - C_f * Vect3 - C_a * Vect5;
+    float Y1d7cP3a5fMM = C_d * Vect1 + C_c * Vect7 - C_a * Vect3 + C_f * Vect5;
+
+    blocks[block][0*stride + offset] = C_norm * (Y04P2b6ePP + Y7f1aP3c5dPP);
+    blocks[block][7*stride + offset] = C_norm * (Y04P2b6ePP - Y7f1aP3c5dPP);
+    blocks[block][4*stride + offset] = C_norm * (Y04P2b6ePM + Y7a1fM3d5cMP);
+    blocks[block][3*stride + offset] = C_norm * (Y04P2b6ePM - Y7a1fM3d5cMP);
+
+    blocks[block][1*stride + offset] = C_norm * (Y04M2e6bMP + Y1c7dM3f5aPM);
+    blocks[block][5*stride + offset] = C_norm * (Y04M2e6bMM - Y1d7cP3a5fMM);
+    blocks[block][2*stride + offset] = C_norm * (Y04M2e6bMM + Y1d7cP3a5fMM);
+    blocks[block][6*stride + offset] = C_norm * (Y04M2e6bMP - Y1c7dM3f5aPM);
+}
+
+template <bool interlaced> __global__ __launch_bounds__(64)
+void kern_idct(cudaSurfaceObject_t *surf) {
+    /* Two macroblocks, padded to avoid bank conflicts */
+    __shared__ float blocks[4*2][8*(8+1)];
+
+    auto gid = blockIdx * blockDim + threadIdx, lid = threadIdx;
+    uint comp = gid.z, block = (lid.y << 2) | (lid.x >> 3), idx = lid.x & 0x7;
+    uint chroma_shift = comp != 0 ? params.log2_chroma_w : 0;
+    bool act = gid.x < params.mb_width << (4 - chroma_shift);
+
+    if (act) {
+        for (uint i = 0; i < 8; ++i) {
+            int v = sign_extend(int(get_px<interlaced>(surf[comp], int2(gid.x, (gid.y << 3) | i))), 16);
+            int w = comp == 0 ? params.qmat_luma[i][idx] : params.qmat_chroma[i][idx];
+            blocks[block][i * 9 + idx] = float(v * w);
+        }
+    }
+
+    /* Row-wise iDCT */
+    __syncthreads();
+    idct(blocks, block, idx * 9, 1);
+
+    /* Column-wise iDCT */
+    __syncthreads();
+    idct(blocks, block, idx, 9);
+
+    float fact = 1.0f / (1 << (12 - params.depth)), off = 1 << (params.depth - 1);
+    int maxv = (1 << params.depth) - 1;
+
+    /* 7.5.1 Color Component Samples. Rescale, clamp and write back to global memory */
+    __syncthreads();
+    if (act) {
+        for (uint i = 0; i < 8; ++i) {
+            float v = blocks[block][i * 9 + idx] * fact + off;
+            put_px<interlaced>(surf[comp], int2(gid.x, (gid.y << 3) | i), clamp(int(v), 0, maxv));
+        }
+    }
+}
+
 int CudaProresDecoder::parse_frame_header(ProresFrame &frame, util::Bytestream &bs) {
     // 5.1.1 Frame Header Syntax
     auto hdr_size = bs.get_be<std::uint16_t>();
@@ -259,14 +354,14 @@ int CudaProresDecoder::parse_frame_header(ProresFrame &frame, util::Bytestream &
     auto qmat_flags = bs.get_be<std::uint16_t>();
 
     if (qmat_flags >> 0 & util::mask(1))
-        bs.read_into(frame.luma_qmat.data(), frame.luma_qmat.size());
+        bs.read_into(frame.luma_qmat[0], sizeof(frame.luma_qmat) * sizeof(std::uint8_t));
     else
-        std::fill_n(frame.luma_qmat.data(), frame.luma_qmat.size(), 4);
+        std::fill_n(frame.luma_qmat [0], sizeof(frame.luma_qmat) * sizeof(std::uint8_t), 4);
 
     if (qmat_flags >> 1 & util::mask(1))
-        bs.read_into(frame.chroma_qmat.data(), frame.chroma_qmat.size());
+        bs.read_into(frame.chroma_qmat[0], sizeof(frame.chroma_qmat) * sizeof(std::uint8_t));
     else
-        std::copy_n(frame.luma_qmat.data(), frame.luma_qmat.size(), frame.chroma_qmat.data());
+        std::copy_n(frame.luma_qmat   [0], sizeof(frame.luma_qmat  ) * sizeof(std::uint8_t), frame.chroma_qmat[0]);
 
     frame.bottom_field = frame.first_field ^ (frame.interlace_mode == ProresInterlaceMode::InterlacedTff);
 
@@ -412,21 +507,32 @@ int CudaProresDecoder::decode(ProresFrame frame, AVFrame *dst) {
         .bottom_field    = static_cast<std::uint8_t>(frame.bottom_field)
     };
 
+    std::copy_n(frame.luma_qmat  [0], sizeof(frame.luma_qmat  ) * sizeof(std::uint8_t), p.qmat_luma  [0]);
+    std::copy_n(frame.chroma_qmat[0], sizeof(frame.chroma_qmat) * sizeof(std::uint8_t), p.qmat_chroma[0]);
+
     CUDA_CHECK(cudaMemcpy(surfaces,      surfobjs         .data(), surfobjs         .size() * sizeof(cudaSurfaceObject_t), cudaMemcpyDefault));
     CUDA_CHECK(cudaMemcpy(slice_offsets, slice_offsets_cpu.data(), slice_offsets_cpu.size() * sizeof(std::uint32_t      ), cudaMemcpyDefault));
     CUDA_CHECK(cudaMemcpy(slice_ctxs,    slice_ctxs_cpu   .data(), slice_ctxs_cpu   .size() * sizeof(SliceContext       ), cudaMemcpyDefault));
     CUDA_CHECK(cudaMemcpy(slice_data,    frame.buf->data,  frame.buf->size,                                                cudaMemcpyDefault));
-    CUDA_CHECK(cudaMemcpyToSymbol(params_vld, &p, sizeof(p)));
+    CUDA_CHECK(cudaMemcpyToSymbol(params, &p, sizeof(p)));
 
-    auto grid_size  = dim3(util::ceil_rshift(frame.slice_width, 3), util::ceil_rshift(frame.mb_height, 3), 3),
-         block_size = dim3(8, 8, 1);
+    auto vld_grid_size   = dim3(util::ceil_rshift(frame.slice_width, 3), util::ceil_rshift(frame.mb_height, 3), 3),
+         vld_block_size  = dim3(8, 8, 1);
+    auto idct_grid_size  = dim3(util::ceil_rshift(frame.mb_width, 1), frame.mb_height, 3),
+         idct_block_size = dim3(32, 2, 1);
     if (frame.interlace_mode == ProresInterlaceMode::Progressive) {
-        color_vld<false><<<grid_size, block_size>>>(
+        kern_color_vld<false><<<vld_grid_size, vld_block_size>>>(
             static_cast<cudaSurfaceObject_t *>(surfaces), static_cast<std::uint32_t *>(slice_offsets), static_cast<SliceContext *>(slice_ctxs)
         );
+        kern_idct<false><<<idct_grid_size, idct_block_size>>>(
+            static_cast<cudaSurfaceObject_t *>(surfaces)
+        );
     } else {
-        color_vld<true><<<grid_size, block_size>>>(
+        kern_color_vld<true><<<vld_grid_size, vld_block_size>>>(
             static_cast<cudaSurfaceObject_t *>(surfaces), static_cast<std::uint32_t *>(slice_offsets), static_cast<SliceContext *>(slice_ctxs)
+        );
+        kern_idct<true><<<idct_grid_size, idct_block_size>>>(
+            static_cast<cudaSurfaceObject_t *>(surfaces)
         );
     }
 
