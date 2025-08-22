@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <cstdint>
+#include <string>
 
 extern "C" {
 #include <libavutil/avutil.h>
@@ -65,26 +66,27 @@ int main(int argc, char **argv) {
     LAV_CHECK(av_image_fill_arrays(fr->data, fr->linesize, static_cast<std::uint8_t *>(dat),
                                    pixfmt, stream->codecpar->width, stream->codecpar->height, 1));
 
+    std::string path(0x20, '\0');
     auto decoder = CudaProresDecoder(stream->codecpar->bits_per_raw_sample);
-    while (av_read_frame(fmt_ctx, pkt) >= 0) {
+    for (int i = 0; av_read_frame(fmt_ctx, pkt) >= 0; ++i) {
         SCOPEGUARD([&pkt] { av_packet_unref(pkt); });
 
         if (pkt->stream_index != stream_idx)
             continue;
 
-        std::printf("Received packet: size %#x\n", pkt->size);
+        std::printf("Decoding packet %03d: size %#x\n", i, pkt->size);
 
         decoder.decode(pkt->buf, fr);
 
-        auto *fp = std::fopen("out.yuv", "wb");
+        std::snprintf(path.data(), path.size(), "frame-%d.yuv", i);
+
+        auto *fp = std::fopen(path.data(), "wb");
         SCOPEGUARD([&fp] { std::fclose(fp); });
 
         for (int i = 0; i < 4; ++i) {
             if (fr->data[i])
                 std::fwrite(fr->data[i], fr->linesize[i], fr->height, fp);
         }
-
-        break;
     }
 }
 
