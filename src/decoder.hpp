@@ -92,7 +92,7 @@ class CudaProresDecoder {
         int parse_picture_header(ProresFrame &frame, util::Bytestream &bs);
 
         template <bool interlaced>
-        void launch_kernels(const ProresFrame &frame, void *surfs, void *slice_offsets, void *slice_ctxs) const;
+        void launch_kernels(const ProresFrame &frame, void *surfs, std::uint32_t *slice_offsets) const;
 
     private:
         int depth;

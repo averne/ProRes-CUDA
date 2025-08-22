@@ -40,7 +40,28 @@ static T clamp(T v, auto lo, auto hi) {
     return min(max(v, lo), hi);
 }
 
+template <std::unsigned_integral T> __device__ __forceinline__
+static int bitCount(T v) {
+    if constexpr (std::is_same_v<T, std::uint64_t>)
+        return __popcll(v);
+    else
+        return __popc(v);
+}
+
 // CUDA doesn't have a bitfield extract intrinsic for some reason
+template <std::unsigned_integral T> __device__ __forceinline__
+static T bitfieldExtract(T v, int off, int bits) {
+    if constexpr (std::is_same_v<T, std::uint64_t>) {
+        std::uint64_t tmp = v;
+        asm volatile("bfe.u64 %0, %1, %2, %3;" : "=l"(tmp) : "l"(tmp), "r"(off), "r"(bits));
+        return static_cast<T>(tmp);
+    } else {
+        std::uint32_t tmp = v;
+        asm volatile("bfe.u32 %0, %1, %2, %3;" : "=r"(tmp) : "r"(tmp), "r"(off), "r"(bits));
+        return static_cast<T>(tmp);
+    }
+}
+
 template <typename T> __device__ __forceinline__
 static T sign_extend(T v, int bits) {
     if constexpr (sizeof(T) == sizeof(std::uint64_t)) {

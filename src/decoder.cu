@@ -38,6 +38,7 @@ struct KernelParams {
     std::uint16_t mb_height;
     std::uint16_t slice_width;
     std::uint16_t slice_height;
+    std::uint8_t  log2_slice_width;
     std::uint8_t  log2_chroma_w;
     std::uint8_t  depth;
     std::uint8_t  alpha_info;
@@ -45,12 +46,6 @@ struct KernelParams {
 
     std::uint8_t  qmat_luma  [8][8];
     std::uint8_t  qmat_chroma[8][8];
-};
-
-struct SliceContext {
-    std::uint16_t mb_x;
-    std::uint16_t mb_y;
-    std::uint8_t  mb_count;
 };
 
 __constant__ KernelParams params;
@@ -104,13 +99,13 @@ uint decode_codeword(util::Bitstream &gb, std::uint16_t codebook)
 }
 
 template <bool interlaced> __device__
-void decode_comp(cudaSurfaceObject_t dst, util::Bitstream gb, SliceContext ctx, uint qscale)
+void decode_comp(cudaSurfaceObject_t dst, util::Bitstream gb, uint2 mb_pos, uint mb_count, uint qscale)
 {
     uint is_luma = uint(blockIdx.z == 0);
     uint chroma_shift = bool(is_luma) ? 0 : params.log2_chroma_w;
 
-    uint num_blocks = ctx.mb_count << (2 - chroma_shift);
-    int2 base_pos = int2(ctx.mb_x << (4 - chroma_shift), ctx.mb_y << 4);
+    uint num_blocks = mb_count << (2 - chroma_shift);
+    int2 base_pos = int2(mb_pos.x << (4 - chroma_shift), mb_pos.y << 4);
 
     /* 7.1.1.3 DC Coefficients */
     {
@@ -203,7 +198,7 @@ void decode_comp(cudaSurfaceObject_t dst, util::Bitstream gb, SliceContext ctx, 
 }
 
 template <bool interlaced> __global__ __launch_bounds__(64)
-void kern_color_vld(cudaSurfaceObject_t *dst, const std::uint32_t *slice_offsets, const SliceContext *slice_ctxs)
+void kern_color_vld(cudaSurfaceObject_t *dst, const std::uint32_t *slice_offsets)
 {
     auto gid = blockIdx * blockDim + threadIdx;
     if (gid.x >= params.slice_width || gid.y >= params.slice_height)
@@ -257,20 +252,45 @@ void kern_color_vld(cudaSurfaceObject_t *dst, const std::uint32_t *slice_offsets
     if (gb.left_bits() == 0)
         return;
 
+    /**
+     * 4 ProRes Frame Structure
+     * ProRes tiles pictures into a grid of slices, whose size is determined
+     * by the log2_slice_width parameter (height is always 1 MB).
+     * Each slice has a width of (1 << log2_slice_width) MBs, until the picture
+     * cannot accommodate a full one. At this point, the remaining space
+     * is recursively completed using the first smaller power of two that fits
+     * (see Figure 1).
+     * The maximum number of extra slices is 3, when log2_slice_width is 3,
+     * with sizes 4, 2 and 1 MBs.
+     * The mb_width parameter therefore also represents the number of full slices,
+     * when interpreted as a fixed-point number with log2_slice_width fractional bits.
+     */
+    uint frac      = bitfieldExtract(uint(params.mb_width), 0, params.log2_slice_width),
+         num_extra = bitCount(frac);
+
+    uint diff = params.slice_width - gid.x - 1,
+         off  = max(int(diff - num_extra + 1) << 2, 0);
+
+    uint log2_width = min(findLSB(frac - diff >> diff) + diff + off, params.log2_slice_width);
+
+    uint mb_x = (min(gid.x, params.slice_width - num_extra) << params.log2_slice_width) +
+                (frac & (0xf << log2_width + 1)),
+         mb_y = gid.y;
+
     /* Entropy decoding, inverse scanning, first part of inverse quantization */
-    decode_comp<interlaced>(dst[gid.z], gb, slice_ctxs[slice_idx], qscale);
+    decode_comp<interlaced>(dst[gid.z], gb, uint2(mb_x, mb_y), 1 << log2_width, qscale);
 }
 
 /* 7.1.2 Scanned Alpha */
 template <bool interlaced> __device__
-void decode_alpha(cudaSurfaceObject_t dst, util::Bitstream gb, SliceContext ctx) {
+void decode_alpha(cudaSurfaceObject_t dst, util::Bitstream gb, uint2 mb_pos, uint mb_count) {
     auto gid = blockIdx * blockDim + threadIdx;
 
-    int2 base_pos = int2(ctx.mb_x, ctx.mb_y) << 4;
-    uint block_shift = findMSB(ctx.mb_count) + 4, block_mask = (1 << block_shift) - 1;
+    int2 base_pos = int2(mb_pos.x, mb_pos.y) << 4;
+    uint block_shift = findMSB(mb_count) + 4, block_mask = (1 << block_shift) - 1;
 
     uint mask = (1 << (4 << params.alpha_info)) - 1;
-    uint num_values = (ctx.mb_count << 4) * min(params.height - (gid.y << 4), 16);
+    uint num_values = (mb_count << 4) * min(params.height - (gid.y << 4), 16);
 
     uint num_cw_bits  = params.alpha_info == 1 ? 5 : 8,
          num_flc_bits = params.alpha_info == 1 ? 9 : 17;
@@ -327,7 +347,7 @@ void decode_alpha(cudaSurfaceObject_t dst, util::Bitstream gb, SliceContext ctx)
 }
 
 template <bool interlaced> __global__ __launch_bounds__(64)
-void kern_alpha_vld(cudaSurfaceObject_t *dst, const std::uint32_t *slice_offsets, const SliceContext *slice_ctxs) {
+void kern_alpha_vld(cudaSurfaceObject_t *dst, const std::uint32_t *slice_offsets) {
     auto gid = blockIdx * blockDim + threadIdx;
     if (gid.x >= params.slice_width || gid.y >= params.slice_height)
         return;
@@ -346,7 +366,19 @@ void kern_alpha_vld(cudaSurfaceObject_t *dst, const std::uint32_t *slice_offsets
     util::Bitstream gb;
     gb.init(bs + skip_size, slice_size - skip_size);
 
-    decode_alpha<interlaced>(dst[3], gb, slice_ctxs[slice_idx]);
+    uint frac      = bitfieldExtract(uint(params.mb_width), 0, params.log2_slice_width),
+         num_extra = bitCount(frac);
+
+    uint diff = params.slice_width - gid.x - 1,
+         off  = max(int(diff - num_extra + 1) << 2, 0);
+
+    uint log2_width = min(findLSB(frac - diff >> diff) + diff + off, params.log2_slice_width);
+
+    uint mb_x = (min(gid.x, params.slice_width - num_extra) << params.log2_slice_width) +
+                (frac & (0xf << log2_width + 1)),
+         mb_y = gid.y;
+
+    decode_alpha<interlaced>(dst[3], gb, uint2(mb_x, mb_y), 1 << log2_width);
 }
 
 // https://github.com/NVIDIA/cuda-samples/blob/master/Samples/2_Concepts_and_Techniques/dct8x8/dct8x8_kernel2.cuh
@@ -511,24 +543,18 @@ int CudaProresDecoder::parse_picture_header(ProresFrame &frame, util::Bytestream
 }
 
 template <bool interlaced>
-void CudaProresDecoder::launch_kernels(const ProresFrame &frame, void *surfs, void *slice_offsets, void *slice_ctxs) const {
+void CudaProresDecoder::launch_kernels(const ProresFrame &frame, void *surfs, std::uint32_t *slice_offsets) const {
     auto vld_grid_size   = dim3(util::ceil_rshift(frame.slice_width, 3), util::ceil_rshift(frame.mb_height, 3), 3),
          vld_block_size  = dim3(8, 8, 1);
     auto idct_grid_size  = dim3(util::ceil_rshift(frame.mb_width, 1), frame.mb_height, 3),
          idct_block_size = dim3(32, 2, 1);
 
     if (!this->skip_color)
-        kern_color_vld<interlaced><<<vld_grid_size, vld_block_size>>>(
-            static_cast<cudaSurfaceObject_t *>(surfs), static_cast<std::uint32_t *>(slice_offsets), static_cast<SliceContext *>(slice_ctxs)
-        );
+        kern_color_vld<interlaced><<<vld_grid_size, vld_block_size>>>(static_cast<cudaSurfaceObject_t *>(surfs), slice_offsets);
     if (!this->skip_color && !this->skip_idct)
-        kern_idct<interlaced><<<idct_grid_size, idct_block_size>>>(
-            static_cast<cudaSurfaceObject_t *>(surfs)
-        );
+        kern_idct<interlaced><<<idct_grid_size, idct_block_size>>>(static_cast<cudaSurfaceObject_t *>(surfs));
     if (!this->skip_alpha && frame.alpha_type != ProresAlphaType::None)
-        kern_alpha_vld<interlaced><<<vld_grid_size, vld_block_size>>>(
-            static_cast<cudaSurfaceObject_t *>(surfs), static_cast<std::uint32_t *>(slice_offsets), static_cast<SliceContext *>(slice_ctxs)
-        );
+        kern_alpha_vld<interlaced><<<vld_grid_size, vld_block_size>>>(static_cast<cudaSurfaceObject_t *>(surfs), slice_offsets);
 }
 
 int CudaProresDecoder::decode(ProresFrame frame, AVFrame *dst) {
@@ -549,24 +575,6 @@ int CudaProresDecoder::decode(ProresFrame frame, AVFrame *dst) {
     std::vector<std::uint32_t> slice_offsets_cpu(frame.slice_sizes.size() + 1, 0);
     std::inclusive_scan(frame.slice_sizes.begin(), frame.slice_sizes.end(), slice_offsets_cpu.begin() + 1,
                         std::plus(), std::uint32_t()); // Explicitly use 32-bit accumulator to avoid overflow
-
-    int mb_x = 0, slice_mb_width = 1 << frame.log2_slice_mb_width;
-    std::vector<SliceContext> slice_ctxs_cpu(frame.slice_sizes.size());
-    for (std::size_t i = 0; i < frame.slice_sizes.size(); ++i) {
-        auto &slice_ctx = slice_ctxs_cpu[i];
-
-        while (frame.mb_width - mb_x < slice_mb_width)
-            slice_mb_width >>= 1;
-
-        slice_ctx.mb_x = mb_x;
-        slice_ctx.mb_y = static_cast<std::uint16_t>(i / frame.slice_width);
-        slice_ctx.mb_count = slice_mb_width;
-
-        mb_x += slice_mb_width;
-
-        if (mb_x == frame.mb_width)
-            mb_x = 0, slice_mb_width = 1 << frame.log2_slice_mb_width;
-    }
 
     AVPixelFormat pixfmt;
     switch ((this->depth << 16) | (static_cast<int>(frame.alpha_type) << 8) | (static_cast<int>(frame.chroma_fmt) << 0)) {
@@ -626,29 +634,28 @@ int CudaProresDecoder::decode(ProresFrame frame, AVFrame *dst) {
         CUDA_CHECK(cudaCreateSurfaceObject(&surfobjs[i], &desc));
     }
 
-    void *surfaces, *slice_offsets, *slice_ctxs, *slice_data;
+    void *surfaces, *slice_offsets, *slice_data;
     CUDA_CHECK(cudaMalloc(&surfaces,      pixdesc->nb_components   * sizeof(cudaSurfaceObject_t)));
     CUDA_CHECK(cudaMalloc(&slice_offsets, slice_offsets_cpu.size() * sizeof(std::uint32_t      )));
-    CUDA_CHECK(cudaMalloc(&slice_ctxs,    slice_ctxs_cpu   .size() * sizeof(SliceContext       )));
     CUDA_CHECK(cudaMalloc(&slice_data,    frame.buf->size));
     SCOPEGUARD([&surfaces     ] { cudaFree(surfaces     ); });
     SCOPEGUARD([&slice_offsets] { cudaFree(slice_offsets); });
-    SCOPEGUARD([&slice_ctxs   ] { cudaFree(slice_ctxs   ); });
     SCOPEGUARD([&slice_data   ] { cudaFree(slice_data   ); });
 
     auto p = KernelParams{
-        .slice_data      = reinterpret_cast<CUdeviceptr>(slice_data) + bs.tell(),
-        .bitstream_size  = static_cast<std::uint32_t>(frame.buf->size - bs.tell()),
-        .width           = frame.pic_width,
-        .height          = frame.pic_height,
-        .mb_width        = frame.mb_width,
-        .mb_height       = frame.mb_height,
-        .slice_width     = frame.slice_width,
-        .slice_height    = frame.mb_height,
-        .log2_chroma_w   = static_cast<std::uint8_t>(frame.chroma_fmt == ProresChromaFormat::C422 ? 1 : 0),
-        .depth           = static_cast<std::uint8_t>(this->depth),
-        .alpha_info      = static_cast<std::uint8_t>(frame.alpha_type),
-        .bottom_field    = static_cast<std::uint8_t>(frame.bottom_field)
+        .slice_data       = reinterpret_cast<CUdeviceptr>(slice_data) + bs.tell(),
+        .bitstream_size   = static_cast<std::uint32_t>(frame.buf->size - bs.tell()),
+        .width            = frame.pic_width,
+        .height           = frame.pic_height,
+        .mb_width         = frame.mb_width,
+        .mb_height        = frame.mb_height,
+        .slice_width      = frame.slice_width,
+        .slice_height     = frame.mb_height,
+        .log2_slice_width = frame.log2_slice_mb_width,
+        .log2_chroma_w    = pixdesc->log2_chroma_w,
+        .depth            = static_cast<std::uint8_t>(this->depth),
+        .alpha_info       = static_cast<std::uint8_t>(frame.alpha_type),
+        .bottom_field     = static_cast<std::uint8_t>(frame.bottom_field)
     };
 
     std::copy_n(frame.luma_qmat  [0], sizeof(frame.luma_qmat  ) * sizeof(std::uint8_t), p.qmat_luma  [0]);
@@ -656,14 +663,13 @@ int CudaProresDecoder::decode(ProresFrame frame, AVFrame *dst) {
 
     CUDA_CHECK(cudaMemcpy(surfaces,      surfobjs         .data(), pixdesc->nb_components   * sizeof(cudaSurfaceObject_t), cudaMemcpyDefault));
     CUDA_CHECK(cudaMemcpy(slice_offsets, slice_offsets_cpu.data(), slice_offsets_cpu.size() * sizeof(std::uint32_t      ), cudaMemcpyDefault));
-    CUDA_CHECK(cudaMemcpy(slice_ctxs,    slice_ctxs_cpu   .data(), slice_ctxs_cpu   .size() * sizeof(SliceContext       ), cudaMemcpyDefault));
     CUDA_CHECK(cudaMemcpy(slice_data,    frame.buf->data,  frame.buf->size,                                                cudaMemcpyDefault));
     CUDA_CHECK(cudaMemcpyToSymbol(params, &p, sizeof(p)));
 
     if (frame.interlace_mode == ProresInterlaceMode::Progressive)
-        this->launch_kernels<false>(frame, surfaces, slice_offsets, slice_ctxs);
+        this->launch_kernels<false>(frame, surfaces, static_cast<std::uint32_t *>(slice_offsets));
     else
-        this->launch_kernels<true >(frame, surfaces, slice_offsets, slice_ctxs);
+        this->launch_kernels<true >(frame, surfaces, static_cast<std::uint32_t *>(slice_offsets));
 
     CUDA_CHECK(cudaDeviceSynchronize());
 
