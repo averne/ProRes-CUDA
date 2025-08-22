@@ -82,7 +82,8 @@ struct ProresFrame {
 
 class CudaProresDecoder {
     public:
-        CudaProresDecoder(int depth): depth(depth) { };
+        CudaProresDecoder(int depth, bool skip_idct = false, bool skip_color = false, bool skip_alpha = false):
+            depth(depth), skip_idct(skip_idct), skip_color(skip_color), skip_alpha(skip_alpha) { };
 
         int decode(ProresFrame frame, AVFrame *dst);
 
@@ -90,6 +91,10 @@ class CudaProresDecoder {
         int parse_frame_header(ProresFrame &frame, util::Bytestream &bs);
         int parse_picture_header(ProresFrame &frame, util::Bytestream &bs);
 
+        template <bool interlaced>
+        void launch_kernels(const ProresFrame &frame, void *surfs, void *slice_offsets, void *slice_ctxs) const;
+
     private:
         int depth;
+        bool skip_idct, skip_color, skip_alpha;
 };

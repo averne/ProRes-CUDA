@@ -510,6 +510,27 @@ int CudaProresDecoder::parse_picture_header(ProresFrame &frame, util::Bytestream
     return 0;
 }
 
+template <bool interlaced>
+void CudaProresDecoder::launch_kernels(const ProresFrame &frame, void *surfs, void *slice_offsets, void *slice_ctxs) const {
+    auto vld_grid_size   = dim3(util::ceil_rshift(frame.slice_width, 3), util::ceil_rshift(frame.mb_height, 3), 3),
+         vld_block_size  = dim3(8, 8, 1);
+    auto idct_grid_size  = dim3(util::ceil_rshift(frame.mb_width, 1), frame.mb_height, 3),
+         idct_block_size = dim3(32, 2, 1);
+
+    if (!this->skip_color)
+        kern_color_vld<interlaced><<<vld_grid_size, vld_block_size>>>(
+            static_cast<cudaSurfaceObject_t *>(surfs), static_cast<std::uint32_t *>(slice_offsets), static_cast<SliceContext *>(slice_ctxs)
+        );
+    if (!this->skip_color && !this->skip_idct)
+        kern_idct<interlaced><<<idct_grid_size, idct_block_size>>>(
+            static_cast<cudaSurfaceObject_t *>(surfs)
+        );
+    if (!this->skip_alpha && frame.alpha_type != ProresAlphaType::None)
+        kern_alpha_vld<interlaced><<<vld_grid_size, vld_block_size>>>(
+            static_cast<cudaSurfaceObject_t *>(surfs), static_cast<std::uint32_t *>(slice_offsets), static_cast<SliceContext *>(slice_ctxs)
+        );
+}
+
 int CudaProresDecoder::decode(ProresFrame frame, AVFrame *dst) {
     auto bs = util::Bytestream(frame.buf->data, frame.buf->size);
 
@@ -639,33 +660,10 @@ int CudaProresDecoder::decode(ProresFrame frame, AVFrame *dst) {
     CUDA_CHECK(cudaMemcpy(slice_data,    frame.buf->data,  frame.buf->size,                                                cudaMemcpyDefault));
     CUDA_CHECK(cudaMemcpyToSymbol(params, &p, sizeof(p)));
 
-    auto vld_grid_size   = dim3(util::ceil_rshift(frame.slice_width, 3), util::ceil_rshift(frame.mb_height, 3), 3),
-         vld_block_size  = dim3(8, 8, 1);
-    auto idct_grid_size  = dim3(util::ceil_rshift(frame.mb_width, 1), frame.mb_height, 3),
-         idct_block_size = dim3(32, 2, 1);
-    if (frame.interlace_mode == ProresInterlaceMode::Progressive) {
-        kern_color_vld<false><<<vld_grid_size, vld_block_size>>>(
-            static_cast<cudaSurfaceObject_t *>(surfaces), static_cast<std::uint32_t *>(slice_offsets), static_cast<SliceContext *>(slice_ctxs)
-        );
-        kern_idct<false><<<idct_grid_size, idct_block_size>>>(
-            static_cast<cudaSurfaceObject_t *>(surfaces)
-        );
-        if (frame.alpha_type != ProresAlphaType::None)
-            kern_alpha_vld<false><<<vld_grid_size, vld_block_size>>>(
-                static_cast<cudaSurfaceObject_t *>(surfaces), static_cast<std::uint32_t *>(slice_offsets), static_cast<SliceContext *>(slice_ctxs)
-            );
-    } else {
-        kern_color_vld<true><<<vld_grid_size, vld_block_size>>>(
-            static_cast<cudaSurfaceObject_t *>(surfaces), static_cast<std::uint32_t *>(slice_offsets), static_cast<SliceContext *>(slice_ctxs)
-        );
-        kern_idct<true><<<idct_grid_size, idct_block_size>>>(
-            static_cast<cudaSurfaceObject_t *>(surfaces)
-        );
-        if (frame.alpha_type != ProresAlphaType::None)
-            kern_alpha_vld<true><<<vld_grid_size, vld_block_size>>>(
-                static_cast<cudaSurfaceObject_t *>(surfaces), static_cast<std::uint32_t *>(slice_offsets), static_cast<SliceContext *>(slice_ctxs)
-            );
-    }
+    if (frame.interlace_mode == ProresInterlaceMode::Progressive)
+        this->launch_kernels<false>(frame, surfaces, slice_offsets, slice_ctxs);
+    else
+        this->launch_kernels<true >(frame, surfaces, slice_offsets, slice_ctxs);
 
     CUDA_CHECK(cudaDeviceSynchronize());
 

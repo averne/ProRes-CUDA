@@ -34,13 +34,6 @@ namespace util {
 #   define __shared__
 #endif
 
-#define CUDA_CHECK(expr) ({                             \
-    cudaError_t _err_ = (expr);                         \
-    if (_err_ != cudaSuccess)                           \
-        std::printf(#expr ": failed with %s (%d)\n",    \
-            cudaGetErrorString(_err_), _err_);          \
-})
-
 #define _CAT(x, y) x ## y
 #define  CAT(x, y) _CAT(x, y)
 #define _STRING(x) #x
@@ -51,6 +44,13 @@ namespace util {
 #define SCOPEGUARD(f) auto VAR_ANONYMOUS = ::util::ScopeGuard(f)
 
 #define UNUSED(...) ::util::unused(__VA_ARGS__)
+
+#define CUDA_CHECK(expr) ({                                             \
+    cudaError_t _err_ = (expr);                                         \
+    if (_err_ != cudaSuccess)                                           \
+        std::fprintf(stderr, STRING(expr) ": failed with %s (%d)\n",    \
+            cudaGetErrorString(_err_), _err_);                          \
+})
 
 template <typename F>
 struct ScopeGuard {

@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <string>
+#include <getopt.h>
 
 extern "C" {
 #include <libavutil/avutil.h>
@@ -27,30 +28,72 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 }
 
+#define XXH_STATIC_LINKING_ONLY
+#include <xxhash.h>
+
 #include "util.hpp"
 #include "decoder.hpp"
 
 #define LAV_CHECK(expr) ({                                                      \
     if (auto _res_ = (expr); _res_ < 0) {                                       \
         char _tmpstr_[AV_ERROR_MAX_STRING_SIZE];                                \
-        std::printf(STRING(expr) ": error %d (%s)\n", _res_,                    \
-                    av_make_error_string(_tmpstr_, sizeof(_tmpstr_), _res_));   \
+        std::fprintf(stderr, STRING(expr) ": error %d (%s)\n", _res_,           \
+                     av_make_error_string(_tmpstr_, sizeof(_tmpstr_), _res_));  \
         return _res_;                                                           \
     }                                                                           \
 })
 
-int main(int argc, char **argv) {
-    std::printf("Starting now, %s-%s-%s\n", LIBAVUTIL_IDENT, LIBAVFORMAT_IDENT, LIBAVCODEC_IDENT);
+int bail(int argc, char **argv) {
+    std::fprintf(stderr, "Usage: %s [--skip-idct|-i] [--skip-color|-c] [--skip-alpha|-a] "
+                         "[--hash|-x] [--stdout|-o] [--path|-p path] [--frames|-f num_frames] "
+                         "<video>\n", argv[0]);
+    return 1;
+}
 
-    if (argc < 2) {
-        std::printf("Usage: %s input\n", argv[0]);
-        return 1;
+int main(int argc, char **argv) {
+    std::string o_path;
+    bool skip_idct = false, skip_color = false, skip_alpha = false,
+         o_hash    = false, o_stdout   = false, o_file     = false;
+    int num_frames = INT_MAX;
+
+    const struct option long_options[] = {
+        {"skip-idct",  no_argument,       nullptr, 'i'},
+        {"skip-color", no_argument,       nullptr, 'c'},
+        {"skip-alpha", no_argument,       nullptr, 'a'},
+        {"hash",       no_argument,       nullptr, 'x'},
+        {"stdout",     no_argument,       nullptr, 'o'},
+        {"path",       required_argument, nullptr, 'p'},
+        {"frames",     required_argument, nullptr, 'f'},
+        {"help",       no_argument,       nullptr, 'h'},
+        {},
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "icaxop:f:h", long_options, nullptr)) != -1) {
+        switch (opt) {
+            case 'i': skip_idct  = true; break;
+            case 'c': skip_color = true; break;
+            case 'a': skip_alpha = true; break;
+            case 'x': o_hash     = true; break;
+            case 'o': o_stdout   = true; break;
+            case 'p': o_file     = true; o_path = optarg; break;
+            case 'f': num_frames = std::atoi(optarg); break;
+            case 'h':
+            default:
+                return bail(argc, argv);
+        }
     }
+
+    if (optind >= argc)
+        return bail(argc, argv);
+
+    std::fprintf(stderr, "Opening %s with %s-%s-%s\n", argv[optind],
+                 LIBAVUTIL_IDENT, LIBAVFORMAT_IDENT, LIBAVCODEC_IDENT);
 
     AVFormatContext *fmt_ctx = nullptr;
     SCOPEGUARD([&fmt_ctx] { avformat_close_input(&fmt_ctx); });
 
-    LAV_CHECK(avformat_open_input(&fmt_ctx, argv[1], nullptr, nullptr));
+    LAV_CHECK(avformat_open_input(&fmt_ctx, argv[optind], nullptr, nullptr));
     LAV_CHECK(avformat_find_stream_info(fmt_ctx, nullptr));
 
     int stream_idx;
@@ -58,13 +101,13 @@ int main(int argc, char **argv) {
 
     auto *stream = fmt_ctx->streams[stream_idx];
     if (stream->codecpar->codec_id != AV_CODEC_ID_PRORES) {
-        std::printf("Unsupported codec %s\n", avcodec_get_name(stream->codecpar->codec_id));
+        std::fprintf(stderr, "Unsupported codec %s\n", avcodec_get_name(stream->codecpar->codec_id));
         return 1;
     }
 
     auto pixfmt = static_cast<AVPixelFormat>(stream->codecpar->format);
 
-    std::printf("Video stream: idx %d, %s profile, %dx%d %s\n", stream_idx,
+    std::fprintf(stderr, "Video stream: idx %d, %s profile, %dx%d %s\n", stream_idx,
         avcodec_profile_name(stream->codecpar->codec_id, stream->codecpar->profile),
         stream->codecpar->width, stream->codecpar->height, av_get_pix_fmt_name(pixfmt));
 
@@ -83,27 +126,37 @@ int main(int argc, char **argv) {
     LAV_CHECK(av_image_fill_arrays(fr->data, fr->linesize, static_cast<std::uint8_t *>(dat),
                                    pixfmt, stream->codecpar->width, stream->codecpar->height, 1));
 
-    std::string path(0x20, '\0');
-    auto decoder = CudaProresDecoder(stream->codecpar->bits_per_raw_sample);
-    for (int i = 0; av_read_frame(fmt_ctx, pkt) >= 0; ++i) {
+    XXH64_state_t hash_state;
+    if (o_hash)
+        XXH64_reset(&hash_state, 0);
+
+    FILE *fp = nullptr;
+    SCOPEGUARD([&fp] { if (fp) std::fclose(fp); });
+    if (o_file)
+        fp = std::fopen(o_path.c_str(), "wb");
+
+    auto decoder = CudaProresDecoder(stream->codecpar->bits_per_raw_sample, skip_idct, skip_color, skip_alpha);
+    for (int i = 0; i < num_frames && av_read_frame(fmt_ctx, pkt) >= 0; ++i) {
         SCOPEGUARD([&pkt] { av_packet_unref(pkt); });
 
         if (pkt->stream_index != stream_idx)
             continue;
 
-        std::printf("Decoding packet %03d: size %#x\n", i, pkt->size);
+        std::fprintf(stderr, "Decoding packet %03d: size %#x\n", i, pkt->size);
 
         decoder.decode(pkt->buf, fr);
 
-        std::snprintf(path.data(), path.size(), "frame-%d.yuv", i);
-
-        auto *fp = std::fopen(path.data(), "wb");
-        SCOPEGUARD([&fp] { std::fclose(fp); });
-
         for (int i = 0; i < 4; ++i) {
-            if (fr->data[i])
-                std::fwrite(fr->data[i], fr->linesize[i], fr->height, fp);
+            if (fr->data[i]) {
+                if (i <= 2 && skip_color) continue;
+                if (i  > 2 && skip_alpha) continue;
+                if (o_hash)   XXH64_update(&hash_state, fr->data[i], fr->linesize[i] * fr->height);
+                if (o_stdout) std::fwrite(fr->data[i], fr->linesize[i], fr->height, stdout);
+                if (o_file)   std::fwrite(fr->data[i], fr->linesize[i], fr->height, fp);
+            }
         }
     }
-}
 
+    if (o_hash)
+        std::printf("%016" PRIx64 "\n" , XXH64_digest(&hash_state));
+}
